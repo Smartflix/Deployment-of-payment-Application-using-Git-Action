@@ -9,7 +9,7 @@ metadata:
     app: auth-api
     version: stable
 spec:
-  replicas: 2
+  replicas: 3
   selector:
     matchLabels:
       app: auth-api
