@@ -1,0 +1,260 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+  <title>Payday Platform — Dashboard</title>
+  <style>
+    * { box-sizing: border-box; margin: 0; padding: 0; }
+    body { font-family: 'Segoe UI', Tahoma, Geneva, Verdana, sans-serif; background: #0f172a; color: #e2e8f0; min-height: 100vh; }
+
+    /* ── Header ── */
+    header { background: #1e293b; border-bottom: 1px solid #334155; padding: 1rem 2rem; display: flex; align-items: center; justify-content: space-between; }
+    header h1 { font-size: 1.4rem; color: #38bdf8; font-weight: 700; }
+    .version-badge { background: #0ea5e9; color: white; padding: 2px 10px; border-radius: 999px; font-size: 0.75rem; }
+    .status-dot { display: inline-block; width: 10px; height: 10px; border-radius: 50%; background: #22c55e; margin-right: 6px; animation: pulse 2s infinite; }
+    @keyframes pulse { 0%,100%{opacity:1} 50%{opacity:.4} }
+
+    /* ── Main layout ── */
+    main { max-width: 1100px; margin: 0 auto; padding: 2rem; }
+
+    /* ── Auth section ── */
+    #auth-section { background: #1e293b; border: 1px solid #334155; border-radius: 12px; padding: 1.5rem; margin-bottom: 2rem; }
+    #auth-section h2 { margin-bottom: 1rem; color: #94a3b8; font-size: 0.9rem; text-transform: uppercase; letter-spacing: .05em; }
+    .input-row { display: flex; gap: 0.75rem; flex-wrap: wrap; }
+    input { background: #0f172a; border: 1px solid #475569; border-radius: 8px; padding: 0.6rem 1rem; color: #e2e8f0; font-size: 0.95rem; width: 200px; }
+    button { background: #0ea5e9; color: white; border: none; border-radius: 8px; padding: 0.6rem 1.4rem; cursor: pointer; font-size: 0.95rem; transition: background .2s; }
+    button:hover { background: #38bdf8; }
+    button.danger { background: #ef4444; }
+    button.danger:hover { background: #f87171; }
+    #auth-msg { margin-top: 0.75rem; font-size: 0.9rem; min-height: 1.2rem; }
+    .ok { color: #22c55e; } .err { color: #ef4444; }
+
+    /* ── Stats cards ── */
+    .stats-grid { display: grid; grid-template-columns: repeat(auto-fill, minmax(200px, 1fr)); gap: 1rem; margin-bottom: 2rem; }
+    .card { background: #1e293b; border: 1px solid #334155; border-radius: 12px; padding: 1.25rem 1.5rem; }
+    .card .label { font-size: 0.8rem; color: #94a3b8; text-transform: uppercase; letter-spacing: .05em; }
+    .card .value { font-size: 2rem; font-weight: 700; margin-top: 0.25rem; }
+    .card .value.green { color: #22c55e; }
+    .card .value.blue  { color: #38bdf8; }
+    .card .value.yellow{ color: #facc15; }
+    .card .value.red   { color: #ef4444; }
+
+    /* ── Payments table ── */
+    .panel { background: #1e293b; border: 1px solid #334155; border-radius: 12px; overflow: hidden; margin-bottom: 2rem; }
+    .panel-header { padding: 1rem 1.5rem; border-bottom: 1px solid #334155; display: flex; align-items: center; justify-content: space-between; }
+    .panel-header h2 { font-size: 1rem; font-weight: 600; }
+    table { width: 100%; border-collapse: collapse; font-size: 0.875rem; }
+    th { padding: .75rem 1rem; text-align: left; color: #64748b; font-weight: 500; border-bottom: 1px solid #334155; }
+    td { padding: .75rem 1rem; border-bottom: 1px solid #1e293b; }
+    tr:last-child td { border-bottom: none; }
+    tr:hover td { background: #0f172a55; }
+    .badge { display: inline-block; padding: 2px 10px; border-radius: 999px; font-size: 0.75rem; font-weight: 600; }
+    .badge.completed  { background:#14532d; color:#4ade80; }
+    .badge.pending    { background:#713f12; color:#fbbf24; }
+    .badge.processing { background:#1e3a5f; color:#60a5fa; }
+    .badge.failed     { background:#450a0a; color:#f87171; }
+
+    /* ── Payment form ── */
+    #pay-form { display: flex; gap: 0.75rem; flex-wrap: wrap; align-items: flex-end; }
+    #pay-form input { width: 160px; }
+    #pay-msg { margin-top: 0.75rem; font-size: 0.9rem; }
+
+    /* ── Footer ── */
+    footer { text-align: center; color: #475569; font-size: 0.8rem; padding: 2rem; }
+  </style>
+</head>
+<body>
+
+<header>
+  <h1>💳 Payday Platform</h1>
+  <div>
+    <span class="status-dot"></span>
+    <span id="svc-status">Services Online</span>
+    <span class="version-badge" id="ver-badge">v1.0.0</span>
+  </div>
+</header>
+
+<main>
+
+  <!-- Auth -->
+  <div id="auth-section">
+    <h2>Authentication</h2>
+    <div class="input-row">
+      <input id="username" placeholder="Username" value="admin" />
+      <input id="password" type="password" placeholder="Password" value="password123" />
+      <button onclick="login()">Login</button>
+      <button class="danger" onclick="logout()">Logout</button>
+    </div>
+    <div id="auth-msg"></div>
+  </div>
+
+  <!-- Stats -->
+  <div class="stats-grid">
+    <div class="card"><div class="label">Total Payments</div><div class="value blue" id="stat-total">—</div></div>
+    <div class="card"><div class="label">Completed</div><div class="value green" id="stat-completed">—</div></div>
+    <div class="card"><div class="label">Pending</div><div class="value yellow" id="stat-pending">—</div></div>
+    <div class="card"><div class="label">Failed</div><div class="value red" id="stat-failed">—</div></div>
+    <div class="card"><div class="label">Total Volume</div><div class="value blue" id="stat-volume">—</div></div>
+  </div>
+
+  <!-- Create Payment -->
+  <div class="panel">
+    <div class="panel-header"><h2>Create Payment</h2></div>
+    <div style="padding:1.25rem 1.5rem">
+      <div id="pay-form">
+        <input id="pay-merchant" placeholder="Merchant ID" value="merchant1" />
+        <input id="pay-amount" type="number" placeholder="Amount" value="250.00" />
+        <input id="pay-currency" placeholder="Currency" value="USD" style="width:100px" />
+        <input id="pay-desc" placeholder="Description" value="Test payment" />
+        <button onclick="createPayment()">Create</button>
+      </div>
+      <div id="pay-msg"></div>
+    </div>
+  </div>
+
+  <!-- Payments List -->
+  <div class="panel">
+    <div class="panel-header">
+      <h2>Recent Payments</h2>
+      <button onclick="loadPayments()" style="font-size:.8rem;padding:.4rem .9rem">Refresh</button>
+    </div>
+    <table>
+      <thead>
+        <tr>
+          <th>ID</th><th>Merchant</th><th>Amount</th><th>Currency</th><th>Status</th><th>Created</th>
+        </tr>
+      </thead>
+      <tbody id="payments-body">
+        <tr><td colspan="6" style="text-align:center;color:#64748b;padding:2rem">Login and click Refresh to load payments</td></tr>
+      </tbody>
+    </table>
+  </div>
+
+</main>
+
+<footer>Payday Platform &mdash; DevOps Demo &mdash; Powered by Kubernetes + GitHub Actions</footer>
+
+<script>
+  const PAYMENTS_API = "/api/payments";
+  const AUTH_API     = "/api/auth";
+
+  let token = localStorage.getItem("payday_token") || "";
+
+  // ── Version / status ──────────────────────────────────────────────────────
+  async function checkHealth() {
+    try {
+      const res = await fetch(PAYMENTS_API + "/health");
+      if (res.ok) {
+        const d = await res.json();
+        document.getElementById("ver-badge").textContent = "v" + (d.version || "1.0.0");
+        document.getElementById("svc-status").textContent = "Services Online";
+      }
+    } catch { document.getElementById("svc-status").textContent = "Services Unreachable"; }
+  }
+
+  // ── Auth ──────────────────────────────────────────────────────────────────
+  async function login() {
+    const username = document.getElementById("username").value;
+    const password = document.getElementById("password").value;
+    const msg = document.getElementById("auth-msg");
+    try {
+      const res = await fetch(AUTH_API + "/login", {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({ username, password })
+      });
+      const data = await res.json();
+      if (res.ok && data.token) {
+        token = data.token;
+        localStorage.setItem("payday_token", token);
+        msg.className = "ok"; msg.textContent = "Logged in as " + username;
+        loadPayments();
+      } else {
+        msg.className = "err"; msg.textContent = data.message || "Login failed";
+      }
+    } catch (e) {
+      msg.className = "err"; msg.textContent = "Auth API unreachable — " + e.message;
+    }
+  }
+
+  function logout() {
+    token = ""; localStorage.removeItem("payday_token");
+    document.getElementById("auth-msg").className = "ok";
+    document.getElementById("auth-msg").textContent = "Logged out";
+  }
+
+  // ── Payments ──────────────────────────────────────────────────────────────
+  async function loadPayments() {
+    const headers = token ? { Authorization: "Bearer " + token } : {};
+    try {
+      const res = await fetch(PAYMENTS_API + "/payments", { headers });
+      const data = await res.json();
+      renderPayments(data.payments || []);
+      updateStats(data.payments || []);
+    } catch (e) {
+      document.getElementById("payments-body").innerHTML =
+        `<tr><td colspan="6" style="color:#ef4444;text-align:center">Could not reach payments-api: ${e.message}</td></tr>`;
+    }
+  }
+
+  function renderPayments(list) {
+    const tbody = document.getElementById("payments-body");
+    if (!list.length) {
+      tbody.innerHTML = '<tr><td colspan="6" style="text-align:center;color:#64748b;padding:2rem">No payments yet</td></tr>';
+      return;
+    }
+    tbody.innerHTML = list.map(p => `
+      <tr>
+        <td style="font-family:monospace;font-size:.8rem">${p.id.substring(0,8)}…</td>
+        <td>${p.merchant_id}</td>
+        <td><strong>$${parseFloat(p.amount).toFixed(2)}</strong></td>
+        <td>${p.currency}</td>
+        <td><span class="badge ${p.status}">${p.status}</span></td>
+        <td>${new Date(p.created_at).toLocaleString()}</td>
+      </tr>
+    `).join("");
+  }
+
+  function updateStats(list) {
+    document.getElementById("stat-total").textContent     = list.length;
+    document.getElementById("stat-completed").textContent = list.filter(p=>p.status==="completed").length;
+    document.getElementById("stat-pending").textContent   = list.filter(p=>p.status==="pending").length;
+    document.getElementById("stat-failed").textContent    = list.filter(p=>p.status==="failed").length;
+    const vol = list.reduce((s,p)=>s+parseFloat(p.amount||0),0);
+    document.getElementById("stat-volume").textContent    = "$" + vol.toLocaleString("en-US",{minimumFractionDigits:2});
+  }
+
+  async function createPayment() {
+    const body = {
+      merchant_id: document.getElementById("pay-merchant").value,
+      amount:      parseFloat(document.getElementById("pay-amount").value),
+      currency:    document.getElementById("pay-currency").value,
+      description: document.getElementById("pay-desc").value,
+    };
+    const msg = document.getElementById("pay-msg");
+    const headers = { "Content-Type": "application/json" };
+    if (token) headers["Authorization"] = "Bearer " + token;
+    try {
+      const res = await fetch(PAYMENTS_API + "/payments", {
+        method: "POST", headers, body: JSON.stringify(body)
+      });
+      const data = await res.json();
+      if (res.ok) {
+        msg.className = "ok"; msg.textContent = "Payment created: " + data.id;
+        loadPayments();
+      } else {
+        msg.className = "err"; msg.textContent = data.error || "Create failed";
+      }
+    } catch (e) {
+      msg.className = "err"; msg.textContent = "Error: " + e.message;
+    }
+  }
+
+  // ── Init ──────────────────────────────────────────────────────────────────
+  checkHealth();
+  if (token) { loadPayments(); document.getElementById("auth-msg").className = "ok"; document.getElementById("auth-msg").textContent = "Token restored from session"; }
+  setInterval(checkHealth, 30000);
+</script>
+</body>
+</html>

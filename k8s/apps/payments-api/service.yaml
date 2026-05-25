@@ -1,0 +1,17 @@
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: payments-api
+  namespace: staging
+  labels:
+    app: payments-api
+spec:
+  selector:
+    app: payments-api
+  ports:
+    - name: http
+      port: 8082
+      targetPort: 8082
+  type: ClusterIP
+

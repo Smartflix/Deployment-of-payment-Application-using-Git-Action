@@ -1,0 +1,111 @@
+# docker-compose.yml — LOCAL DEVELOPMENT ONLY
+# Run with: docker compose up --build
+# This brings up all 4 services + PostgreSQL locally so you can develop without Kubernetes.
+
+version: "3.9"
+
+# ── Shared settings ───────────────────────────────────────────────────────────
+x-common-env: &common-env
+  DATABASE_URL: postgres://payday:payday_dev_password@postgres:5432/payday?sslmode=disable
+  JWT_SECRET: local-dev-jwt-secret-do-not-use-in-production
+
+# ── Services ──────────────────────────────────────────────────────────────────
+services:
+
+  # PostgreSQL database
+  postgres:
+    image: postgres:16-alpine
+    container_name: payday-postgres
+    restart: unless-stopped
+    environment:
+      POSTGRES_DB:       payday
+      POSTGRES_USER:     payday
+      POSTGRES_PASSWORD: payday_dev_password
+    ports:
+      - "5432:5432"
+    volumes:
+      - postgres_data:/var/lib/postgresql/data
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U payday -d payday"]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+      start_period: 10s
+
+  # Auth API (Go)
+  auth-api:
+    build:
+      context: ./apps/auth-api
+      dockerfile: Dockerfile
+    container_name: payday-auth-api
+    restart: unless-stopped
+    environment:
+      <<: *common-env
+      PORT: "8081"
+    ports:
+      - "8081:8081"
+    depends_on:
+      postgres:
+        condition: service_healthy
+    healthcheck:
+      test: ["CMD-SHELL", "wget -qO- http://localhost:8081/health || exit 1"]
+      interval: 15s
+      timeout: 5s
+      retries: 3
+
+  # Payments API (Python/Flask)
+  payments-api:
+    build:
+      context: ./apps/payments-api
+      dockerfile: Dockerfile
+    container_name: payday-payments-api
+    restart: unless-stopped
+    environment:
+      <<: *common-env
+      PORT: "8082"
+      APP_VERSION: "1.0.0-local"
+    ports:
+      - "8082:8082"
+    depends_on:
+      postgres:
+        condition: service_healthy
+    healthcheck:
+      test: ["CMD-SHELL", "wget -qO- http://localhost:8082/health || exit 1"]
+      interval: 15s
+      timeout: 5s
+      retries: 3
+
+  # Worker (Python)
+  worker:
+    build:
+      context: ./apps/worker
+      dockerfile: Dockerfile
+    container_name: payday-worker
+    restart: unless-stopped
+    environment:
+      <<: *common-env
+      PORT: "8083"
+      POLL_INTERVAL_SECONDS: "5"
+    ports:
+      - "8083:8083"
+    depends_on:
+      postgres:
+        condition: service_healthy
+
+  # Frontend (Nginx)
+  frontend:
+    build:
+      context: ./apps/frontend
+      dockerfile: Dockerfile
+    container_name: payday-frontend
+    restart: unless-stopped
+    ports:
+      - "8080:8080"
+    depends_on:
+      - auth-api
+      - payments-api
+
+# ── Volumes ───────────────────────────────────────────────────────────────────
+volumes:
+  postgres_data:
+    driver: local

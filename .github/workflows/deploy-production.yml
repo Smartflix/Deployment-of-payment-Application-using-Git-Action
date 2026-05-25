@@ -1,0 +1,214 @@
+# ─────────────────────────────────────────────────────────────────────────────
+# CD PIPELINE — Deploy to PRODUCTION (Canary) on AWS EKS
+# ─────────────────────────────────────────────────────────────────────────────
+#
+# Flow:
+#   Manual trigger → Human approval (GitHub Environment) →
+#   Deploy via Argo Rollouts canary (10% → 30% → 50% → manual → 100%) →
+#   Auto-rollback if Prometheus metrics show error rate > 5%
+#
+# GitHub Secrets needed:
+#   AWS_ACCESS_KEY_ID      → AWS IAM access key
+#   AWS_SECRET_ACCESS_KEY  → AWS IAM secret key
+#   AWS_REGION             → e.g. us-east-1
+#   AWS_ACCOUNT_ID         → 12-digit AWS account ID
+#   EKS_CLUSTER_NAME       → e.g. payday-cluster
+#   DB_PASSWORD            → RDS password (production)
+#   JWT_SECRET             → JWT signing secret (production)
+#   RDS_ENDPOINT           → RDS endpoint from Terraform output
+
+name: CD — Deploy to Production (Canary)
+
+on:
+  workflow_dispatch:
+    inputs:
+      image_tag:
+        description: "Image tag to deploy (e.g. sha-abc1234). Leave blank for latest from main."
+        required: false
+        type: string
+      confirm:
+        description: "Type DEPLOY to confirm production deployment"
+        required: true
+        type: string
+
+jobs:
+
+  validate-input:
+    name: Validate confirmation
+    runs-on: ubuntu-latest
+    steps:
+      - name: Check DEPLOY confirmation
+        run: |
+          if [ "${{ github.event.inputs.confirm }}" != "DEPLOY" ]; then
+            echo "ERROR: Must type DEPLOY to confirm. Got: '${{ github.event.inputs.confirm }}'"
+            exit 1
+          fi
+          echo "Confirmed. Proceeding to production canary deployment."
+
+  deploy-production:
+    name: Canary Deploy to Production (EKS)
+    runs-on: ubuntu-latest
+    needs: [validate-input]
+
+    # GitHub pauses here until a required reviewer approves in the GitHub UI
+    environment:
+      name: production
+      url: https://payday.example.com
+
+    env:
+      ECR_REGISTRY: ${{ secrets.AWS_ACCOUNT_ID }}.dkr.ecr.${{ secrets.AWS_REGION }}.amazonaws.com
+
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+
+      - name: Configure AWS credentials
+        uses: aws-actions/configure-aws-credentials@v4
+        with:
+          aws-access-key-id:     ${{ secrets.AWS_ACCESS_KEY_ID }}
+          aws-secret-access-key: ${{ secrets.AWS_SECRET_ACCESS_KEY }}
+          aws-region:            ${{ secrets.AWS_REGION }}
+
+      - name: Install kubectl
+        uses: azure/setup-kubectl@v4
+        with:
+          version: "v1.29.0"
+
+      - name: Install Argo Rollouts kubectl plugin
+        run: |
+          curl -LO https://github.com/argoproj/argo-rollouts/releases/latest/download/kubectl-argo-rollouts-linux-amd64
+          chmod +x kubectl-argo-rollouts-linux-amd64
+          sudo mv kubectl-argo-rollouts-linux-amd64 /usr/local/bin/kubectl-argo-rollouts
+
+      - name: Connect kubectl to EKS
+        run: |
+          aws eks update-kubeconfig \
+            --name ${{ secrets.EKS_CLUSTER_NAME }} \
+            --region ${{ secrets.AWS_REGION }}
+
+      - name: Resolve image tag
+        id: tag
+        run: |
+          if [ -n "${{ github.event.inputs.image_tag }}" ]; then
+            TAG="${{ github.event.inputs.image_tag }}"
+          else
+            TAG="sha-$(echo ${{ github.sha }} | head -c 7)"
+          fi
+          echo "IMAGE_TAG=${TAG}" >> $GITHUB_OUTPUT
+          echo "Deploying: ${TAG}"
+
+      - name: Create/update production secrets
+        run: |
+          kubectl create secret generic postgres-secret \
+            --from-literal=POSTGRES_PASSWORD="${{ secrets.DB_PASSWORD }}" \
+            --from-literal=DATABASE_URL="postgres://payday:${{ secrets.DB_PASSWORD }}@${{ secrets.RDS_ENDPOINT }}/payday?sslmode=require" \
+            --namespace production \
+            --dry-run=client -o yaml | kubectl apply -f -
+
+          kubectl create secret generic app-secrets \
+            --from-literal=JWT_SECRET="${{ secrets.JWT_SECRET }}" \
+            --namespace production \
+            --dry-run=client -o yaml | kubectl apply -f -
+
+      - name: Substitute image tags
+        run: |
+          TAG="${{ steps.tag.outputs.IMAGE_TAG }}"
+          REGISTRY="${{ env.ECR_REGISTRY }}"
+          find k8s/ -name "*.yaml" -exec \
+            sed -i "s|ghcr.io/GITHUB_OWNER|${REGISTRY}|g; s|IMAGE_TAG|${TAG}|g" {} \;
+
+      - name: Apply namespaces and base resources
+        run: |
+          kubectl apply -f k8s/namespaces/namespaces.yaml
+          # Worker: direct deployment (no canary needed for background jobs)
+          kubectl apply -f k8s/apps/worker/deployment.yaml -n production
+          # Frontend: direct deployment
+          kubectl apply -f k8s/apps/frontend/deployment.yaml -n production
+          kubectl apply -f k8s/apps/frontend/service.yaml
+          # HPA
+          kubectl apply -f k8s/apps/auth-api/hpa.yaml
+          kubectl apply -f k8s/apps/payments-api/hpa.yaml
+
+      # ── CANARY ROLLOUT ─────────────────────────────────────────────────────
+      - name: Apply Argo Rollouts canary config
+        run: |
+          kubectl apply -f k8s/rollouts/payments-api-rollout.yaml
+          kubectl apply -f k8s/rollouts/auth-api-rollout.yaml
+
+      - name: Trigger canary — update image tags
+        run: |
+          TAG="${{ steps.tag.outputs.IMAGE_TAG }}"
+          REGISTRY="${{ env.ECR_REGISTRY }}"
+
+          kubectl argo rollouts set image payments-api \
+            payments-api=${REGISTRY}/payday-payments-api:${TAG} \
+            -n production
+
+          kubectl argo rollouts set image auth-api \
+            auth-api=${REGISTRY}/payday-auth-api:${TAG} \
+            -n production
+
+          echo "Canary started — 10% of traffic going to ${TAG}"
+
+      - name: Monitor canary
+        run: |
+          echo ""
+          echo "━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━"
+          echo "CANARY ROLLOUT IN PROGRESS"
+          echo "━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━"
+          echo "Image: ${{ steps.tag.outputs.IMAGE_TAG }}"
+          echo "  10%  → NEW version (canary)  ← CURRENTLY HERE"
+          echo "  90%  → OLD version (stable)"
+          echo ""
+          echo "Prometheus is checking error rate every 60s."
+          echo "If error rate > 5%, rollout auto-aborts and reverts."
+          echo ""
+          echo "To watch live:   kubectl argo rollouts get rollout payments-api -n production --watch"
+          echo "To approve:      kubectl argo rollouts promote payments-api -n production"
+          echo "To abort/revert: kubectl argo rollouts abort payments-api -n production"
+          echo ""
+          timeout 900 kubectl argo rollouts status payments-api -n production --timeout=900s || true
+
+      - name: Show rollout status
+        run: |
+          kubectl argo rollouts get rollout payments-api -n production
+          kubectl argo rollouts get rollout auth-api -n production
+
+      - name: Apply ingress
+        run: kubectl apply -f k8s/ingress/ingress.yaml -n production
+
+      - name: Deployment summary
+        run: |
+          echo ""
+          echo "━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━"
+          echo "CANARY DEPLOYMENT STARTED SUCCESSFULLY"
+          echo "━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━"
+          echo "Image tag : ${{ steps.tag.outputs.IMAGE_TAG }}"
+          echo "Namespace : production"
+          echo "Traffic   : 10% → new, 90% → old"
+          echo ""
+          echo "REQUIRED NEXT STEPS:"
+          echo "  1. Monitor Grafana for 5-10 minutes"
+          echo "  2. If healthy → promote:"
+          echo "     kubectl argo rollouts promote payments-api -n production"
+          echo "     kubectl argo rollouts promote auth-api -n production"
+          echo "  3. If unhealthy → abort:"
+          echo "     kubectl argo rollouts abort payments-api -n production"
+          echo "     kubectl argo rollouts abort auth-api -n production"
+
+  notify-failure:
+    name: Notify on Failure
+    runs-on: ubuntu-latest
+    needs: [deploy-production]
+    if: failure()
+    steps:
+      - name: Failure notice
+        run: |
+          echo "PRODUCTION DEPLOYMENT FAILED"
+          echo "Tag: ${{ github.event.inputs.image_tag }}"
+          echo "Triggered by: ${{ github.actor }}"
+          echo ""
+          echo "Emergency rollback:"
+          echo "  aws eks update-kubeconfig --name YOUR_CLUSTER --region us-east-1"
+          echo "  kubectl argo rollouts abort payments-api -n production"
+          echo "  kubectl argo rollouts abort auth-api -n production"

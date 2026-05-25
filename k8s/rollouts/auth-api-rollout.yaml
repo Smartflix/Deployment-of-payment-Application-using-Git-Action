@@ -1,0 +1,137 @@
+# Argo Rollout for auth-api (production)
+# Simpler canary: 10% → 50% → 100% with automatic metric checks
+
+---
+apiVersion: argoproj.io/v1alpha1
+kind: AnalysisTemplate
+metadata:
+  name: auth-api-success-rate
+  namespace: production
+spec:
+  metrics:
+    - name: success-rate
+      interval: 60s
+      count: 3
+      failureLimit: 1
+      provider:
+        prometheus:
+          address: http://prometheus-server.monitoring.svc.cluster.local:9090
+          query: |
+            sum(rate(auth_http_requests_total{
+              namespace="production",
+              app="auth-api",
+              status!~"5.."
+            }[2m])) /
+            sum(rate(auth_http_requests_total{
+              namespace="production",
+              app="auth-api"
+            }[2m]))
+      successCondition: result[0] >= 0.95
+      failureCondition: result[0] < 0.95
+
+---
+apiVersion: argoproj.io/v1alpha1
+kind: Rollout
+metadata:
+  name: auth-api
+  namespace: production
+  labels:
+    app: auth-api
+spec:
+  replicas: 4
+  selector:
+    matchLabels:
+      app: auth-api
+  strategy:
+    canary:
+      canaryService: auth-api-canary
+      stableService: auth-api-stable
+      trafficRouting:
+        nginx:
+          stableIngress: payday-ingress
+      steps:
+        - setWeight: 10
+        - analysis:
+            templates:
+              - templateName: auth-api-success-rate
+        - setWeight: 50
+        - pause:
+            duration: 5m
+        - setWeight: 100
+      autoPromotionEnabled: false
+
+  template:
+    metadata:
+      labels:
+        app: auth-api
+      annotations:
+        prometheus.io/scrape: "true"
+        prometheus.io/port:   "8081"
+        prometheus.io/path:   "/metrics"
+    spec:
+      securityContext:
+        runAsNonRoot: true
+        runAsUser: 65532
+      containers:
+        - name: auth-api
+          image: ghcr.io/GITHUB_OWNER/payday-auth-api:IMAGE_TAG
+          ports:
+            - containerPort: 8081
+          env:
+            - name: PORT
+              value: "8081"
+            - name: JWT_SECRET
+              valueFrom:
+                secretKeyRef:
+                  name: app-secrets
+                  key: JWT_SECRET
+            - name: DATABASE_URL
+              valueFrom:
+                secretKeyRef:
+                  name: postgres-secret
+                  key: DATABASE_URL
+          resources:
+            requests:
+              cpu: 100m
+              memory: 64Mi
+            limits:
+              cpu: 500m
+              memory: 256Mi
+          readinessProbe:
+            httpGet:
+              path: /health
+              port: 8081
+            initialDelaySeconds: 5
+            periodSeconds: 10
+          livenessProbe:
+            httpGet:
+              path: /health
+              port: 8081
+            initialDelaySeconds: 15
+            periodSeconds: 20
+
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: auth-api-stable
+  namespace: production
+spec:
+  selector:
+    app: auth-api
+  ports:
+    - port: 8081
+      targetPort: 8081
+
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: auth-api-canary
+  namespace: production
+spec:
+  selector:
+    app: auth-api
+  ports:
+    - port: 8081
+      targetPort: 8081

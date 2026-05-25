@@ -1,0 +1,35 @@
+# Resource Quotas prevent any single namespace from consuming too many cluster resources.
+# This is important for cost control and preventing "noisy neighbor" problems.
+
+---
+# ── Staging: Lower limits (cheaper) ──────────────────────────────────────────
+apiVersion: v1
+kind: ResourceQuota
+metadata:
+  name: staging-quota
+  namespace: staging
+spec:
+  hard:
+    requests.cpu:    "4"       # Total CPU request limit across ALL pods in staging
+    requests.memory: 4Gi      # Total memory request limit
+    limits.cpu:      "8"
+    limits.memory:   8Gi
+    pods:            "30"      # Max 30 pods in staging
+    services:        "10"
+
+---
+# ── LimitRange: Default limits for pods that don't specify them ───────────────
+apiVersion: v1
+kind: LimitRange
+metadata:
+  name: default-limits
+  namespace: staging
+spec:
+  limits:
+    - type: Container
+      default:
+        cpu: 200m
+        memory: 256Mi
+      defaultRequest:
+        cpu: 100m
+        memory: 128Mi

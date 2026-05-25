@@ -1,0 +1,67 @@
+# Staging Deployment for payments-api
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: payments-api
+  namespace: staging
+  labels:
+    app: payments-api
+    version: stable
+spec:
+  replicas: 2
+  selector:
+    matchLabels:
+      app: payments-api
+  strategy:
+    type: RollingUpdate
+    rollingUpdate:
+      maxSurge: 1
+      maxUnavailable: 0
+  template:
+    metadata:
+      labels:
+        app: payments-api
+        version: stable
+      annotations:
+        prometheus.io/scrape: "true"
+        prometheus.io/port:   "8082"
+        prometheus.io/path:   "/metrics"
+    spec:
+      securityContext:
+        runAsNonRoot: true
+        runAsUser: 1000
+      containers:
+        - name: payments-api
+          image: ghcr.io/GITHUB_OWNER/payday-payments-api:IMAGE_TAG
+          ports:
+            - containerPort: 8082
+          env:
+            - name: PORT
+              value: "8082"
+            - name: APP_VERSION
+              value: "IMAGE_TAG"
+            - name: DATABASE_URL
+              valueFrom:
+                secretKeyRef:
+                  name: postgres-secret
+                  key: DATABASE_URL
+          resources:
+            requests:
+              cpu: 150m
+              memory: 128Mi
+            limits:
+              cpu: 500m
+              memory: 512Mi
+          readinessProbe:
+            httpGet:
+              path: /health
+              port: 8082
+            initialDelaySeconds: 10
+            periodSeconds: 10
+            failureThreshold: 3
+          livenessProbe:
+            httpGet:
+              path: /health
+              port: 8082
+            initialDelaySeconds: 20
+            periodSeconds: 20

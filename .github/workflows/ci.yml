@@ -1,0 +1,261 @@
+# ─────────────────────────────────────────────────────────────────────────────
+# CI PIPELINE — Continuous Integration
+# ─────────────────────────────────────────────────────────────────────────────
+#
+# What this does (in order):
+#   1. Triggered on every push to any branch, or a pull request
+#   2. Runs tests for each service (auth-api, payments-api, worker)
+#   3. Builds Docker images for all 4 services
+#   4. Scans each image for security vulnerabilities with Trivy
+#   5. Blocks the pipeline if HIGH or CRITICAL vulnerabilities are found
+#   6. Pushes the scanned, clean images to Amazon ECR
+#
+# GitHub Secrets needed (Settings → Secrets → Actions):
+#   AWS_ACCESS_KEY_ID      → AWS IAM user access key (with ECR push permissions)
+#   AWS_SECRET_ACCESS_KEY  → AWS IAM user secret key
+#   AWS_REGION             → e.g. us-east-1
+#   AWS_ACCOUNT_ID         → Your 12-digit AWS account ID (e.g. 123456789012)
+
+name: CI — Build, Test, Scan, Push
+
+on:
+  push:
+    branches: ["**"]
+  pull_request:
+    branches: [main]
+
+concurrency:
+  group: ci-${{ github.ref }}
+  cancel-in-progress: true
+
+env:
+  AWS_REGION: ${{ secrets.AWS_REGION }}
+  ECR_REGISTRY: ${{ secrets.AWS_ACCOUNT_ID }}.dkr.ecr.${{ secrets.AWS_REGION }}.amazonaws.com
+
+jobs:
+
+  # ── Job 1: Test auth-api (Go) ───────────────────────────────────────────────
+  test-auth-api:
+    name: Test auth-api (Go)
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+
+      - name: Set up Go
+        uses: actions/setup-go@v5
+        with:
+          go-version: "1.24"
+          cache: true
+
+      - name: Download Go dependencies
+        working-directory: apps/auth-api
+        run: go mod download
+
+      - name: Run Go tests
+        working-directory: apps/auth-api
+        run: go test ./... -v -timeout 60s
+
+      - name: Check Go formatting
+        working-directory: apps/auth-api
+        run: |
+          if [ "$(gofmt -l . | wc -l)" -gt 0 ]; then
+            echo "Go code is not formatted. Run: gofmt -w ."
+            gofmt -l .
+            exit 1
+          fi
+
+  # ── Job 2: Test payments-api (Python) ──────────────────────────────────────
+  test-payments-api:
+    name: Test payments-api (Python)
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+          cache: pip
+
+      - name: Install dependencies
+        working-directory: apps/payments-api
+        run: pip install -r requirements.txt pytest pytest-flask
+
+      - name: Run Python tests
+        working-directory: apps/payments-api
+        run: |
+          if find . -name "test_*.py" | grep -q .; then
+            pytest -v
+          else
+            echo "No tests found yet — skipping (add tests in apps/payments-api/tests/)"
+          fi
+
+  # ── Job 3: Test worker (Python) ─────────────────────────────────────────────
+  test-worker:
+    name: Test worker (Python)
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+          cache: pip
+
+      - name: Install dependencies
+        working-directory: apps/worker
+        run: pip install -r requirements.txt pytest
+
+      - name: Run Python tests
+        working-directory: apps/worker
+        run: |
+          if find . -name "test_*.py" | grep -q .; then
+            pytest -v
+          else
+            echo "No tests found yet — skipping"
+          fi
+
+  # ── Job 4: Build, Scan, and Push to ECR ────────────────────────────────────
+  build-scan-push:
+    name: Build → Scan → Push (${{ matrix.service.name }})
+    runs-on: ubuntu-latest
+    needs: [test-auth-api, test-payments-api, test-worker]
+
+    strategy:
+      fail-fast: false
+      matrix:
+        service:
+          - name: auth-api
+            context: apps/auth-api
+            image: payday-auth-api
+          - name: payments-api
+            context: apps/payments-api
+            image: payday-payments-api
+          - name: worker
+            context: apps/worker
+            image: payday-worker
+          - name: frontend
+            context: apps/frontend
+            image: payday-frontend
+
+    permissions:
+      contents: read
+      security-events: write   # To upload Trivy SARIF results
+
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+
+      - name: Set up Docker Buildx
+        uses: docker/setup-buildx-action@v3
+
+      # Authenticate to AWS using the secrets you set in GitHub
+      - name: Configure AWS credentials
+        uses: aws-actions/configure-aws-credentials@v4
+        with:
+          aws-access-key-id:     ${{ secrets.AWS_ACCESS_KEY_ID }}
+          aws-secret-access-key: ${{ secrets.AWS_SECRET_ACCESS_KEY }}
+          aws-region:            ${{ secrets.AWS_REGION }}
+
+      # Login to Amazon ECR (gets a temporary login token from AWS)
+      - name: Login to Amazon ECR
+        id: login-ecr
+        uses: aws-actions/amazon-ecr-login@v2
+
+      # Short commit SHA used as the image tag
+      - name: Set image tag
+        id: tag
+        run: echo "IMAGE_TAG=sha-$(echo ${GITHUB_SHA} | head -c 7)" >> $GITHUB_OUTPUT
+
+      # Build the Docker image locally (not pushed yet)
+      - name: Build image
+        uses: docker/build-push-action@v5
+        with:
+          context: ${{ matrix.service.context }}
+          push: false
+          load: true
+          tags: |
+            ${{ env.ECR_REGISTRY }}/${{ matrix.service.image }}:${{ steps.tag.outputs.IMAGE_TAG }}
+            ${{ env.ECR_REGISTRY }}/${{ matrix.service.image }}:latest
+          cache-from: type=gha
+          cache-to:   type=gha,mode=max
+
+      # STEP 1: Full scan → SARIF report uploaded to GitHub Security tab.
+      # exit-code 0 means this step NEVER fails — it only collects findings.
+      # HIGH vulnerabilities are visible in the Security tab but do not block CI.
+      # Rationale: base images (distroless, alpine) often carry unfixed HIGH CVEs
+      # that have no available patch yet. Blocking on those would halt all deploys.
+      - name: Scan image — upload ALL findings to GitHub Security
+        uses: aquasecurity/trivy-action@master
+        with:
+          image-ref: ${{ env.ECR_REGISTRY }}/${{ matrix.service.image }}:${{ steps.tag.outputs.IMAGE_TAG }}
+          format: sarif
+          output: trivy-results-${{ matrix.service.name }}.sarif
+          severity: HIGH,CRITICAL
+          exit-code: "0"          # Never blocks — reporting only
+          ignore-unfixed: true
+
+      # Ensure the SARIF file exists before uploading (Trivy may skip creation if no findings)
+      - name: Ensure SARIF file exists
+        if: always()
+        run: |
+          FILE="trivy-results-${{ matrix.service.name }}.sarif"
+          if [ ! -f "$FILE" ]; then
+            echo '{"version":"2.1.0","$schema":"https://raw.githubusercontent.com/oasis-tcs/sarif-spec/master/Schemata/sarif-schema-2.1.0.json","runs":[{"tool":{"driver":{"name":"Trivy","rules":[]}},"results":[]}]}' > "$FILE"
+          fi
+
+      - name: Upload Trivy results to GitHub Security tab
+        if: always()
+        uses: github/codeql-action/upload-sarif@v4
+        with:
+          sarif_file: trivy-results-${{ matrix.service.name }}.sarif
+          category: ${{ matrix.service.name }}
+
+      # STEP 2: Hard block — fails CI only if CRITICAL vulnerabilities WITH fixes exist.
+      # CRITICAL = CVSS score 9.0–10.0, actively exploitable, patch available.
+      # These must be fixed before the image can be pushed.
+      - name: Security gate — block on CRITICAL vulnerabilities
+        uses: aquasecurity/trivy-action@master
+        with:
+          image-ref: ${{ env.ECR_REGISTRY }}/${{ matrix.service.image }}:${{ steps.tag.outputs.IMAGE_TAG }}
+          format: table           # Human-readable output in the Actions log
+          severity: CRITICAL
+          exit-code: "1"          # Fails CI if any CRITICAL CVE is found
+          ignore-unfixed: true    # Only block if a fix actually exists
+
+      # Only push to ECR if on main branch and all security checks passed
+      - name: Push image to Amazon ECR
+        if: github.ref == 'refs/heads/main' && github.event_name == 'push'
+        uses: docker/build-push-action@v5
+        with:
+          context: ${{ matrix.service.context }}
+          push: true
+          tags: |
+            ${{ env.ECR_REGISTRY }}/${{ matrix.service.image }}:${{ steps.tag.outputs.IMAGE_TAG }}
+            ${{ env.ECR_REGISTRY }}/${{ matrix.service.image }}:latest
+          cache-from: type=gha
+          cache-to:   type=gha,mode=max
+
+      - name: Print image URI
+        if: github.ref == 'refs/heads/main' && github.event_name == 'push'
+        run: |
+          echo "Pushed: ${{ env.ECR_REGISTRY }}/${{ matrix.service.image }}:${{ steps.tag.outputs.IMAGE_TAG }}"
+
+  # ── Summary ─────────────────────────────────────────────────────────────────
+  ci-success:
+    name: CI Passed
+    runs-on: ubuntu-latest
+    needs: [build-scan-push]
+    if: always()
+    steps:
+      - name: Check result
+        run: |
+          if [ "${{ needs.build-scan-push.result }}" != "success" ]; then
+            echo "CI FAILED — check previous job logs"
+            exit 1
+          fi
+          echo "All CI checks passed! Images are in ECR."

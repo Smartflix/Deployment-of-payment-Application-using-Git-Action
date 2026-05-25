@@ -1,0 +1,80 @@
+# ─────────────────────────────────────────────────────────────────────────────
+# VELERO — Kubernetes Backup & Restore
+# ─────────────────────────────────────────────────────────────────────────────
+# Velero backs up Kubernetes resources and PersistentVolumes to Amazon S3.
+# This means if your cluster is destroyed, you can restore everything from S3.
+#
+# INSTALL VELERO (run once after terraform apply):
+#   1. Install Velero CLI: https://velero.io/docs/latest/basic-install/
+#   2. Get the exact install command from Terraform:
+#        terraform -chdir=terraform/eks output velero_install_command
+#   3. Or run directly:
+#        velero install \
+#          --provider aws \
+#          --plugins velero/velero-plugin-for-aws:v1.9.0 \
+#          --bucket payday-cluster-velero-backups-207717182270 \
+#          --backup-location-config region=us-east-1,prefix=velero \
+#          --snapshot-location-config region=us-east-1 \
+#          --service-account-annotations eks.amazonaws.com/role-arn=YOUR_ROLE_ARN \
+#          --no-secret    # Uses IRSA (IAM Roles for Service Accounts)
+#
+# MANUAL BACKUP (on demand):
+#   velero backup create manual-backup-$(date +%Y%m%d) --include-namespaces production,staging
+#
+# RESTORE FROM BACKUP:
+#   velero restore create --from-backup manual-backup-20240101
+
+---
+# ── Scheduled backup: daily at 2 AM UTC ──────────────────────────────────────
+apiVersion: velero.io/v1
+kind: Schedule
+metadata:
+  name: payday-daily-backup
+  namespace: velero
+spec:
+  # Cron format: minute hour day-of-month month day-of-week
+  # "0 2 * * *" = every day at 2:00 AM UTC
+  schedule: "0 2 * * *"
+
+  template:
+    includedNamespaces:
+      - production
+      - staging
+
+    # Backup everything: Deployments, Services, Secrets, ConfigMaps, PVCs, etc.
+    includeClusterResources: true
+
+    # Also snapshot EBS volumes (for PersistentVolumeClaims)
+    snapshotVolumes: true
+
+    # Keep backups for 30 days, then auto-delete
+    ttl: 720h0m0s   # 720 hours = 30 days
+
+    storageLocation: default
+    volumeSnapshotLocations:
+      - default
+
+---
+# ── Weekly full backup (keep 3 months) ───────────────────────────────────────
+apiVersion: velero.io/v1
+kind: Schedule
+metadata:
+  name: payday-weekly-backup
+  namespace: velero
+spec:
+  schedule: "0 3 * * 0"   # Every Sunday at 3 AM UTC
+
+  template:
+    includedNamespaces:
+      - production
+      - staging
+      - monitoring
+      - argocd
+
+    includeClusterResources: true
+    snapshotVolumes: true
+    ttl: 2160h0m0s   # 2160 hours = 90 days
+
+    storageLocation: default
+    volumeSnapshotLocations:
+      - default

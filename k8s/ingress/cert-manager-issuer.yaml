@@ -1,0 +1,26 @@
+---
+# SelfSigned ClusterIssuer — issues certs immediately, no external CA needed.
+# Used for staging where the endpoint is a raw ELB hostname (no owned domain).
+apiVersion: cert-manager.io/v1
+kind: ClusterIssuer
+metadata:
+  name: selfsigned-issuer
+spec:
+  selfSigned: {}
+
+---
+# TLS certificate for the staging ELB endpoint
+apiVersion: cert-manager.io/v1
+kind: Certificate
+metadata:
+  name: payday-staging-tls
+  namespace: staging
+spec:
+  secretName: payday-staging-tls
+  issuerRef:
+    name: selfsigned-issuer
+    kind: ClusterIssuer
+  dnsNames:
+    - a675a6a14fdfb474a94c6120c7573bba-1112124437.us-east-1.elb.amazonaws.com
+  duration: 2160h    # 90 days
+  renewBefore: 360h  # auto-renew 15 days before expiry

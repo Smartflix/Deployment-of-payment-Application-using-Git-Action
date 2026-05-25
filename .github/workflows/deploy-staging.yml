@@ -1,0 +1,303 @@
+# ─────────────────────────────────────────────────────────────────────────────
+# CD PIPELINE — Deploy to STAGING (AWS EKS)
+# ─────────────────────────────────────────────────────────────────────────────
+#
+# What this does:
+#   1. Triggered when CI pipeline succeeds on main branch
+#   2. Authenticates to AWS and configures kubectl for EKS
+#   3. Creates/updates secrets in the staging namespace
+#   4. Substitutes image tags in Kubernetes manifests
+#   5. Deploys all services to the staging namespace
+#   6. Waits for rollouts to complete
+#   7. Runs smoke tests — rolls back automatically if they fail
+#
+# GitHub Secrets needed:
+#   AWS_ACCESS_KEY_ID      → AWS IAM access key
+#   AWS_SECRET_ACCESS_KEY  → AWS IAM secret key
+#   AWS_REGION             → e.g. us-east-1
+#   AWS_ACCOUNT_ID         → 12-digit AWS account ID
+#   EKS_CLUSTER_NAME       → e.g. payday-cluster
+#   DB_PASSWORD            → RDS/Postgres password for staging
+#   JWT_SECRET             → JWT signing secret
+
+name: CD — Deploy to Staging
+
+on:
+  workflow_run:
+    workflows: ["CI — Build, Test, Scan, Push"]
+    types: [completed]
+    branches: [main]
+
+jobs:
+  deploy-staging:
+    name: Deploy to Staging (EKS)
+    runs-on: ubuntu-latest
+    if: ${{ github.event.workflow_run.conclusion == 'success' }}
+
+    environment:
+      name: staging
+      url: https://staging.payday.example.com
+
+    env:
+      ECR_REGISTRY: ${{ secrets.AWS_ACCOUNT_ID }}.dkr.ecr.${{ secrets.AWS_REGION }}.amazonaws.com
+
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+
+      - name: Configure AWS credentials
+        uses: aws-actions/configure-aws-credentials@v4
+        with:
+          aws-access-key-id:     ${{ secrets.AWS_ACCESS_KEY_ID }}
+          aws-secret-access-key: ${{ secrets.AWS_SECRET_ACCESS_KEY }}
+          aws-region:            ${{ secrets.AWS_REGION }}
+
+      - name: Install kubectl
+        uses: azure/setup-kubectl@v4
+        with:
+          version: "v1.29.0"
+
+      - name: Install Argo Rollouts kubectl plugin
+        run: |
+          curl -LO https://github.com/argoproj/argo-rollouts/releases/latest/download/kubectl-argo-rollouts-linux-amd64
+          chmod +x kubectl-argo-rollouts-linux-amd64
+          sudo mv kubectl-argo-rollouts-linux-amd64 /usr/local/bin/kubectl-argo-rollouts
+
+      # Configure kubectl to connect to your EKS cluster
+      - name: Connect kubectl to EKS
+        run: |
+          aws eks update-kubeconfig \
+            --name ${{ secrets.EKS_CLUSTER_NAME }} \
+            --region ${{ secrets.AWS_REGION }}
+
+      - name: Set image tag
+        id: tag
+        run: echo "IMAGE_TAG=sha-$(echo ${{ github.sha }} | head -c 7)" >> $GITHUB_OUTPUT
+
+      # Namespaces must exist before anything else (secrets, deployments, etc.)
+      - name: Apply namespaces
+        run: kubectl apply -f k8s/namespaces/namespaces.yaml
+
+      - name: Install cert-manager
+        run: |
+          helm repo add jetstack https://charts.jetstack.io
+          helm repo update
+
+          # If cert-manager exists but was NOT installed by Helm, clean it up.
+          # CRDs are cluster-scoped and survive namespace deletion — must delete separately.
+          if kubectl get namespace cert-manager &>/dev/null && \
+             ! helm status cert-manager -n cert-manager &>/dev/null; then
+            echo "cert-manager found but not Helm-managed — removing for clean install"
+            kubectl delete namespace cert-manager
+            kubectl wait --for=delete namespace/cert-manager --timeout=120s
+            kubectl delete crd \
+              certificaterequests.cert-manager.io \
+              certificates.cert-manager.io \
+              challenges.acme.cert-manager.io \
+              clusterissuers.cert-manager.io \
+              issuers.cert-manager.io \
+              orders.acme.cert-manager.io \
+              --ignore-not-found=true
+          fi
+
+          helm upgrade --install cert-manager jetstack/cert-manager \
+            --namespace cert-manager --create-namespace \
+            --set installCRDs=true \
+            --wait --timeout 5m
+
+      - name: Apply TLS issuer and certificate
+        run: |
+          kubectl apply -f k8s/ingress/cert-manager-issuer.yaml
+          # Wait for cert-manager to issue the certificate (creates the TLS secret)
+          kubectl wait --for=condition=Ready certificate/payday-staging-tls \
+            -n staging --timeout=120s
+
+      # Create/update Kubernetes secrets in staging namespace from GitHub Secrets
+      - name: Create staging secrets
+        run: |
+          kubectl create secret generic postgres-secret \
+            --from-literal=POSTGRES_PASSWORD="${{ secrets.DB_PASSWORD }}" \
+            --from-literal=DATABASE_URL="postgres://payday:${{ secrets.DB_PASSWORD }}@${{ secrets.RDS_ENDPOINT }}/payday?sslmode=require" \
+            --namespace staging \
+            --dry-run=client -o yaml | kubectl apply -f -
+
+          kubectl create secret generic app-secrets \
+            --from-literal=JWT_SECRET="${{ secrets.JWT_SECRET }}" \
+            --namespace staging \
+            --dry-run=client -o yaml | kubectl apply -f -
+
+      # Replace IMAGE_TAG and ECR_REGISTRY placeholders in all manifest files
+      - name: Substitute image tags
+        run: |
+          TAG="${{ steps.tag.outputs.IMAGE_TAG }}"
+          REGISTRY="${{ env.ECR_REGISTRY }}"
+
+          find k8s/ -name "*.yaml" -exec \
+            sed -i "s|ghcr.io/GITHUB_OWNER|${REGISTRY}|g; s|IMAGE_TAG|${TAG}|g" {} \;
+
+          echo "Set image tag: ${TAG}"
+          echo "Registry: ${REGISTRY}"
+
+      # For staging: use in-cluster PostgreSQL (not RDS, to save costs in staging)
+      - name: Deploy database to staging
+        run: |
+          # Scale StatefulSet to 0 first so the pod releases the PVC.
+          # Without this, kubectl delete pvc hangs forever (pvc-protection finalizer).
+          kubectl scale statefulset/postgres --replicas=0 -n staging 2>/dev/null || true
+          kubectl wait --for=delete pod/postgres-0 -n staging --timeout=90s 2>/dev/null || true
+
+          # PVC is now unbound — safe to delete and recreate fresh.
+          kubectl delete pvc postgres-pvc -n staging --ignore-not-found=true
+
+          kubectl apply -f k8s/database/postgres-statefulset.yaml --namespace staging
+          kubectl rollout status statefulset/postgres -n staging --timeout=600s
+
+      - name: Deploy apps to staging
+        run: |
+          kubectl apply -f k8s/apps/auth-api/deployment.yaml      -n staging
+          kubectl apply -f k8s/apps/auth-api/service.yaml
+          kubectl apply -f k8s/apps/auth-api/hpa.yaml
+
+          kubectl apply -f k8s/apps/payments-api/deployment.yaml  -n staging
+          kubectl apply -f k8s/apps/payments-api/service.yaml
+          kubectl apply -f k8s/apps/payments-api/hpa.yaml
+
+          kubectl apply -f k8s/apps/worker/deployment.yaml        -n staging
+          kubectl apply -f k8s/apps/frontend/deployment.yaml      -n staging
+          kubectl apply -f k8s/apps/frontend/service.yaml
+
+      - name: Apply ingress
+        run: kubectl apply -f k8s/ingress/ingress.yaml -n staging
+
+      - name: Apply resource quotas
+        run: kubectl apply -f k8s/autoscaling/resource-quotas.yaml
+
+      - name: Install / upgrade observability stack
+        run: |
+          helm repo add grafana      https://grafana.github.io/helm-charts
+          helm repo add prometheus-community https://prometheus-community.github.io/helm-charts
+          helm repo update
+
+          # Loki (log aggregation)
+          helm upgrade --install loki grafana/loki \
+            --namespace monitoring --create-namespace \
+            --values k8s/observability/loki-values.yaml \
+            --wait --timeout 5m
+
+          # Promtail (log collector — ships pod logs to Loki)
+          helm upgrade --install promtail grafana/promtail \
+            --namespace monitoring \
+            --set "config.clients[0].url=http://loki:3100/loki/api/v1/push" \
+            --wait --timeout 3m
+
+          # Prometheus + Grafana + Alertmanager
+          kubectl create configmap payday-grafana-dashboard \
+            --from-file=payday-dashboard.json=k8s/observability/grafana-dashboards/payday-dashboard.json \
+            --namespace monitoring --dry-run=client -o yaml | kubectl apply -f -
+
+          helm upgrade --install kube-prometheus-stack prometheus-community/kube-prometheus-stack \
+            --namespace monitoring \
+            --values k8s/observability/prometheus-values.yaml \
+            --wait --timeout 8m
+
+          # Jaeger (distributed tracing)
+          kubectl apply -f k8s/observability/jaeger.yaml
+
+          echo "Observability stack deployed."
+
+      - name: Show pod status
+        run: kubectl get pods -n staging
+
+      - name: Wait for rollouts to complete
+        run: |
+          echo "Waiting for all deployments in parallel..."
+          kubectl rollout status deployment/auth-api     -n staging --timeout=300s &
+          kubectl rollout status deployment/payments-api -n staging --timeout=300s &
+          kubectl rollout status deployment/worker       -n staging --timeout=300s &
+          kubectl rollout status deployment/frontend     -n staging --timeout=300s &
+          wait $(jobs -p)
+          echo "All deployments ready!"
+          kubectl get pods -n staging
+
+      - name: Run smoke tests
+        run: |
+          echo "Running smoke tests..."
+
+          # Clean up any leftover pod from a previous run
+          kubectl delete pod smoke-test -n staging --ignore-not-found=true
+
+          kubectl run smoke-test --image=curlimages/curl:8.7.1 \
+            --restart=Never -n staging \
+            --command -- sleep 120
+
+          kubectl wait --for=condition=Ready pod/smoke-test \
+            -n staging --timeout=60s
+
+          # Show pod and endpoint status so failures are easy to diagnose
+          echo "--- Pods ---"
+          kubectl get pods -n staging
+          echo "--- Endpoints ---"
+          kubectl get endpoints -n staging
+
+          # Helper: retries curl up to 6 times (30s total) to allow pods a moment
+          # to settle after rollout. Captures HTTP code; returns 000 on failure.
+          check_health() {
+            local url=$1
+            local code="000"
+            for i in 1 2 3 4 5 6; do
+              code=$(kubectl exec -n staging smoke-test -- \
+                curl -s -o /dev/null -w "%{http_code}" --max-time 5 "$url" 2>/dev/null) || code="000"
+              [ "$code" = "200" ] && echo "200" && return
+              echo "  attempt $i: got $code, retrying in 5s..." >&2
+              sleep 5
+            done
+            echo "$code"
+          }
+
+          HTTP=$(check_health http://payments-api:8082/health)
+          if [ "$HTTP" != "200" ]; then
+            echo "FAIL: payments-api health returned $HTTP"
+            kubectl logs -l app=payments-api -n staging --tail=30
+            kubectl delete pod smoke-test -n staging --ignore-not-found=true
+            exit 1
+          fi
+          echo "✓ payments-api health OK"
+
+          HTTP=$(check_health http://auth-api:8081/health)
+          if [ "$HTTP" != "200" ]; then
+            echo "FAIL: auth-api health returned $HTTP"
+            kubectl logs -l app=auth-api -n staging --tail=30
+            kubectl delete pod smoke-test -n staging --ignore-not-found=true
+            exit 1
+          fi
+          echo "✓ auth-api health OK"
+
+          LOGIN=$(kubectl exec -n staging smoke-test -- \
+            curl -s -X POST http://auth-api:8081/auth/login \
+            -H "Content-Type: application/json" \
+            -d '{"username":"admin","password":"password123"}') || LOGIN=""
+          if echo "$LOGIN" | grep -q "token"; then
+            echo "✓ Login endpoint works"
+          else
+            echo "FAIL: Login did not return a token"
+            echo "Response: $LOGIN"
+            kubectl delete pod smoke-test -n staging --ignore-not-found=true
+            exit 1
+          fi
+
+          kubectl delete pod smoke-test -n staging --ignore-not-found=true
+          echo "All smoke tests passed!"
+
+      - name: Rollback on failure
+        if: failure()
+        run: |
+          echo "Rolling back staging..."
+          if ! kubectl get namespace staging 2>/dev/null; then
+            echo "Staging namespace does not exist — nothing to roll back"
+            exit 0
+          fi
+          kubectl rollout undo deployment/auth-api     -n staging 2>/dev/null || true
+          kubectl rollout undo deployment/payments-api -n staging 2>/dev/null || true
+          kubectl rollout undo deployment/worker       -n staging 2>/dev/null || true
+          kubectl rollout undo deployment/frontend     -n staging 2>/dev/null || true
+          echo "Rollback complete."

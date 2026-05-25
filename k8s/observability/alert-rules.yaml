@@ -1,0 +1,178 @@
+# PrometheusRule — Custom SLO/SLI alert rules for Payday Platform
+# Applied to the monitoring namespace.
+# Alerts fire in Alertmanager → Slack/PagerDuty/email.
+
+apiVersion: monitoring.coreos.com/v1
+kind: PrometheusRule
+metadata:
+  name: payday-alerts
+  namespace: monitoring
+  labels:
+    release: prometheus   # Must match the Helm release name for prometheus-operator to pick it up
+spec:
+  groups:
+
+    # ── Service Availability Alerts ─────────────────────────────────────────
+    - name: payday.availability
+      rules:
+
+        # Alert if payments-api error rate > 5% for 2 minutes
+        - alert: PaymentsAPIHighErrorRate
+          expr: |
+            (
+              sum(rate(flask_http_request_total{app="payments-api", status=~"5.."}[5m]))
+              /
+              sum(rate(flask_http_request_total{app="payments-api"}[5m]))
+            ) > 0.05
+          for: 2m
+          labels:
+            severity: critical
+            team: backend
+          annotations:
+            summary: "payments-api error rate > 5%"
+            description: "The payments-api is returning errors at {{ $value | humanizePercentage }} rate in {{ $labels.namespace }}. This is breaching the SLO of 95% success rate."
+            runbook: "https://github.com/YOUR_ORG/payday_platform/blob/main/docs/runbooks/high-error-rate.md"
+
+        # Alert if auth-api error rate > 5% for 2 minutes
+        - alert: AuthAPIHighErrorRate
+          expr: |
+            (
+              sum(rate(auth_http_requests_total{app="auth-api", status=~"5.."}[5m]))
+              /
+              sum(rate(auth_http_requests_total{app="auth-api"}[5m]))
+            ) > 0.05
+          for: 2m
+          labels:
+            severity: critical
+            team: backend
+          annotations:
+            summary: "auth-api error rate > 5%"
+            description: "auth-api is returning {{ $value | humanizePercentage }} errors in {{ $labels.namespace }}."
+            runbook: "https://github.com/YOUR_ORG/payday_platform/blob/main/docs/runbooks/high-error-rate.md"
+
+    # ── Latency Alerts ──────────────────────────────────────────────────────
+    - name: payday.latency
+      rules:
+
+        # Alert if 95th percentile latency > 500ms for 5 minutes
+        - alert: PaymentsAPIHighLatency
+          expr: |
+            histogram_quantile(0.95,
+              sum(rate(flask_http_request_duration_seconds_bucket{app="payments-api"}[5m]))
+              by (le, app, namespace)
+            ) > 0.5
+          for: 5m
+          labels:
+            severity: warning
+            team: backend
+          annotations:
+            summary: "payments-api p95 latency > 500ms"
+            description: "95th percentile latency is {{ $value | humanizeDuration }} in {{ $labels.namespace }}. SLO target is 500ms."
+
+        - alert: AuthAPIHighLatency
+          expr: |
+            histogram_quantile(0.95,
+              sum(rate(auth_http_duration_seconds_bucket{app="auth-api"}[5m]))
+              by (le, app, namespace)
+            ) > 0.3
+          for: 5m
+          labels:
+            severity: warning
+            team: backend
+          annotations:
+            summary: "auth-api p95 latency > 300ms"
+            description: "95th percentile auth latency is {{ $value | humanizeDuration }}."
+
+    # ── Pod Health Alerts ───────────────────────────────────────────────────
+    - name: payday.pods
+      rules:
+
+        # Alert if any pod is crash-looping
+        - alert: PodCrashLooping
+          expr: |
+            rate(kube_pod_container_status_restarts_total{
+              namespace=~"staging|production"
+            }[15m]) * 60 > 3
+          for: 5m
+          labels:
+            severity: critical
+          annotations:
+            summary: "Pod {{ $labels.pod }} is crash-looping"
+            description: "Container {{ $labels.container }} in pod {{ $labels.pod }} has restarted {{ $value }} times in the last 15 minutes."
+            runbook: "https://github.com/YOUR_ORG/payday_platform/blob/main/docs/runbooks/pod-crashloop.md"
+
+        # Alert if pod is not ready
+        - alert: PodNotReady
+          expr: |
+            kube_pod_status_ready{
+              namespace=~"staging|production",
+              condition="true"
+            } == 0
+          for: 5m
+          labels:
+            severity: warning
+          annotations:
+            summary: "Pod {{ $labels.pod }} is not ready"
+            description: "Pod {{ $labels.pod }} in {{ $labels.namespace }} has been not ready for 5 minutes."
+
+    # ── Database Alerts ─────────────────────────────────────────────────────
+    - name: payday.database
+      rules:
+
+        - alert: PostgreSQLDown
+          expr: |
+            kube_pod_status_ready{
+              namespace=~"staging|production",
+              pod=~"postgres-.*",
+              condition="true"
+            } == 0
+          for: 1m
+          labels:
+            severity: critical
+            team: infrastructure
+          annotations:
+            summary: "PostgreSQL is down in {{ $labels.namespace }}"
+            description: "The PostgreSQL pod is not ready. All services depending on the DB are affected."
+            runbook: "https://github.com/YOUR_ORG/payday_platform/blob/main/docs/runbooks/db-connection-loss.md"
+
+    # ── Worker Alerts ───────────────────────────────────────────────────────
+    - name: payday.worker
+      rules:
+
+        # Alert if worker error rate spikes
+        - alert: WorkerHighErrorRate
+          expr: rate(worker_errors_total[5m]) > 0.1
+          for: 5m
+          labels:
+            severity: warning
+            team: backend
+          annotations:
+            summary: "Worker error rate is high"
+            description: "The payment worker is experiencing {{ $value }} errors/sec. Payments may not be processing."
+
+        # Alert if pending payments pile up (worker might be stuck)
+        - alert: PendingPaymentsBacklog
+          expr: worker_pending_payments > 100
+          for: 10m
+          labels:
+            severity: warning
+          annotations:
+            summary: "Large backlog of pending payments"
+            description: "There are {{ $value }} pending payments that haven't been processed in 10 minutes. Check worker status."
+
+    # ── Resource Alerts ─────────────────────────────────────────────────────
+    - name: payday.resources
+      rules:
+
+        # Alert if persistent volume is almost full
+        - alert: PersistentVolumeAlmostFull
+          expr: |
+            kubelet_volume_stats_available_bytes{namespace=~"staging|production"}
+            / kubelet_volume_stats_capacity_bytes{namespace=~"staging|production"}
+            < 0.15
+          for: 5m
+          labels:
+            severity: warning
+          annotations:
+            summary: "PersistentVolume {{ $labels.persistentvolumeclaim }} is almost full"
+            description: "PVC {{ $labels.persistentvolumeclaim }} in {{ $labels.namespace }} has less than 15% space remaining."

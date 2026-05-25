@@ -1,0 +1,181 @@
+{
+  "title": "Payday Platform — SLO Dashboard",
+  "uid": "payday-slo-v1",
+  "tags": ["payday", "slo", "production"],
+  "refresh": "30s",
+  "time": { "from": "now-1h", "to": "now" },
+  "panels": [
+    {
+      "id": 1,
+      "title": "🟢 Service Health Overview",
+      "type": "stat",
+      "gridPos": { "h": 4, "w": 24, "x": 0, "y": 0 },
+      "targets": [
+        {
+          "expr": "sum(up{job=~\"payday-apps\"})",
+          "legendFormat": "Services UP"
+        }
+      ],
+      "options": {
+        "colorMode": "background",
+        "graphMode": "none",
+        "justifyMode": "center",
+        "textMode": "auto"
+      }
+    },
+    {
+      "id": 2,
+      "title": "payments-api — Request Rate (req/s)",
+      "type": "timeseries",
+      "gridPos": { "h": 8, "w": 12, "x": 0, "y": 4 },
+      "targets": [
+        {
+          "expr": "sum(rate(flask_http_request_total{app=\"payments-api\"}[5m])) by (status)",
+          "legendFormat": "HTTP {{status}}"
+        }
+      ]
+    },
+    {
+      "id": 3,
+      "title": "payments-api — Error Rate (%)",
+      "type": "timeseries",
+      "gridPos": { "h": 8, "w": 12, "x": 12, "y": 4 },
+      "targets": [
+        {
+          "expr": "100 * sum(rate(flask_http_request_total{app=\"payments-api\", status=~\"5..\"}[5m])) / sum(rate(flask_http_request_total{app=\"payments-api\"}[5m]))",
+          "legendFormat": "Error Rate %"
+        }
+      ],
+      "fieldConfig": {
+        "defaults": {
+          "thresholds": {
+            "steps": [
+              { "color": "green", "value": null },
+              { "color": "yellow", "value": 1 },
+              { "color": "red", "value": 5 }
+            ]
+          },
+          "unit": "percent"
+        }
+      }
+    },
+    {
+      "id": 4,
+      "title": "payments-api — p50/p95/p99 Latency",
+      "type": "timeseries",
+      "gridPos": { "h": 8, "w": 12, "x": 0, "y": 12 },
+      "targets": [
+        {
+          "expr": "histogram_quantile(0.50, sum(rate(flask_http_request_duration_seconds_bucket{app=\"payments-api\"}[5m])) by (le))",
+          "legendFormat": "p50"
+        },
+        {
+          "expr": "histogram_quantile(0.95, sum(rate(flask_http_request_duration_seconds_bucket{app=\"payments-api\"}[5m])) by (le))",
+          "legendFormat": "p95"
+        },
+        {
+          "expr": "histogram_quantile(0.99, sum(rate(flask_http_request_duration_seconds_bucket{app=\"payments-api\"}[5m])) by (le))",
+          "legendFormat": "p99"
+        }
+      ],
+      "fieldConfig": { "defaults": { "unit": "s" } }
+    },
+    {
+      "id": 5,
+      "title": "auth-api — Request Rate & Error Rate",
+      "type": "timeseries",
+      "gridPos": { "h": 8, "w": 12, "x": 12, "y": 12 },
+      "targets": [
+        {
+          "expr": "sum(rate(auth_http_requests_total{app=\"auth-api\"}[5m])) by (status)",
+          "legendFormat": "HTTP {{status}}"
+        }
+      ]
+    },
+    {
+      "id": 6,
+      "title": "Worker — Payments Processed/s",
+      "type": "stat",
+      "gridPos": { "h": 4, "w": 8, "x": 0, "y": 20 },
+      "targets": [
+        {
+          "expr": "sum(rate(worker_payments_processed_total[5m]))",
+          "legendFormat": "processed/s"
+        }
+      ]
+    },
+    {
+      "id": 7,
+      "title": "Worker — Pending Payments Backlog",
+      "type": "gauge",
+      "gridPos": { "h": 4, "w": 8, "x": 8, "y": 20 },
+      "targets": [
+        {
+          "expr": "worker_pending_payments",
+          "legendFormat": "Pending"
+        }
+      ],
+      "fieldConfig": {
+        "defaults": {
+          "thresholds": {
+            "steps": [
+              { "color": "green", "value": null },
+              { "color": "yellow", "value": 50 },
+              { "color": "red", "value": 100 }
+            ]
+          },
+          "max": 200
+        }
+      }
+    },
+    {
+      "id": 8,
+      "title": "Pod Count by Service",
+      "type": "stat",
+      "gridPos": { "h": 4, "w": 8, "x": 16, "y": 20 },
+      "targets": [
+        {
+          "expr": "count(kube_pod_status_ready{namespace=\"production\", condition=\"true\"}) by (pod)",
+          "legendFormat": "{{pod}}"
+        }
+      ]
+    },
+    {
+      "id": 9,
+      "title": "SLO — 30-day Uptime (payments-api)",
+      "type": "stat",
+      "gridPos": { "h": 4, "w": 12, "x": 0, "y": 24 },
+      "targets": [
+        {
+          "expr": "100 * (1 - (sum(increase(flask_http_request_total{app=\"payments-api\", status=~\"5..\"}[30d])) / sum(increase(flask_http_request_total{app=\"payments-api\"}[30d]))))",
+          "legendFormat": "SLO %"
+        }
+      ],
+      "fieldConfig": {
+        "defaults": {
+          "unit": "percent",
+          "thresholds": {
+            "steps": [
+              { "color": "red",    "value": null },
+              { "color": "yellow", "value": 99   },
+              { "color": "green",  "value": 99.9 }
+            ]
+          }
+        }
+      }
+    },
+    {
+      "id": 10,
+      "title": "Canary Rollout Traffic Split",
+      "type": "piechart",
+      "gridPos": { "h": 4, "w": 12, "x": 12, "y": 24 },
+      "targets": [
+        {
+          "expr": "sum(rate(flask_http_request_total{app=\"payments-api\"}[5m])) by (version)",
+          "legendFormat": "{{version}}"
+        }
+      ]
+    }
+  ],
+  "schemaVersion": 38
+}

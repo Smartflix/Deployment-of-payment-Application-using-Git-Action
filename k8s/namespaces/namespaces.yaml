@@ -1,0 +1,43 @@
+# Kubernetes Namespaces
+# Think of namespaces as "folders" that isolate different environments and tools.
+#
+#   staging    → where new code goes FIRST for testing
+#   production → where real customer traffic goes (canary-controlled)
+#   monitoring → Prometheus, Grafana, Loki, Jaeger
+#   argocd     → GitOps controller (Argo CD)
+
+---
+apiVersion: v1
+kind: Namespace
+metadata:
+  name: staging
+  labels:
+    environment: staging
+    managed-by: payday-platform
+
+---
+apiVersion: v1
+kind: Namespace
+metadata:
+  name: production
+  labels:
+    environment: production
+    managed-by: payday-platform
+
+---
+apiVersion: v1
+kind: Namespace
+metadata:
+  name: monitoring
+  labels:
+    purpose: observability
+    managed-by: payday-platform
+
+---
+apiVersion: v1
+kind: Namespace
+metadata:
+  name: argocd
+  labels:
+    purpose: gitops
+    managed-by: payday-platform

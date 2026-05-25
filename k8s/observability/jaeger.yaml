@@ -1,0 +1,103 @@
+# Jaeger — Distributed Tracing
+# Traces show how a single request flows through multiple services.
+# Example: frontend → payments-api → database
+# You can see exactly where time is spent and where errors occur.
+#
+# This uses the "all-in-one" mode (simple, for demo/small scale).
+# For production with high traffic, use Jaeger with Elasticsearch backend.
+
+---
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: jaeger
+  namespace: monitoring
+  labels:
+    app: jaeger
+spec:
+  replicas: 1
+  selector:
+    matchLabels:
+      app: jaeger
+  template:
+    metadata:
+      labels:
+        app: jaeger
+    spec:
+      containers:
+        - name: jaeger
+          image: jaegertracing/all-in-one:1.57
+          ports:
+            - containerPort: 5775  # Zipkin compact UDP
+            - containerPort: 6831  # Jaeger compact UDP (apps send traces here)
+              protocol: UDP
+            - containerPort: 6832  # Jaeger binary UDP
+              protocol: UDP
+            - containerPort: 5778  # Serve configs
+            - containerPort: 16686 # Jaeger UI (open this in browser)
+            - containerPort: 14268 # Jaeger HTTP (apps can send traces here)
+            - containerPort: 9411  # Zipkin HTTP
+          env:
+            - name: COLLECTOR_ZIPKIN_HOST_PORT
+              value: ":9411"
+            # Store traces in memory (for demo). For production, use:
+            # - name: SPAN_STORAGE_TYPE
+            #   value: elasticsearch
+            # - name: ES_SERVER_URLS
+            #   value: http://elasticsearch:9200
+          resources:
+            requests:
+              cpu: 100m
+              memory: 128Mi
+            limits:
+              cpu: 500m
+              memory: 512Mi
+
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: jaeger
+  namespace: monitoring
+  labels:
+    app: jaeger
+spec:
+  selector:
+    app: jaeger
+  ports:
+    - name: udp-compact
+      port: 6831
+      protocol: UDP
+      targetPort: 6831
+    - name: http-collector
+      port: 14268
+      targetPort: 14268
+    - name: ui
+      port: 16686
+      targetPort: 16686
+    - name: zipkin
+      port: 9411
+      targetPort: 9411
+  type: ClusterIP
+
+---
+# Jaeger UI accessible at http://<LB-IP>/jaeger/
+apiVersion: networking.k8s.io/v1
+kind: Ingress
+metadata:
+  name: jaeger-ingress
+  namespace: monitoring
+  annotations:
+    nginx.ingress.kubernetes.io/rewrite-target: /$2
+spec:
+  ingressClassName: nginx
+  rules:
+    - http:
+        paths:
+          - path: /jaeger(/|$)(.*)
+            pathType: ImplementationSpecific
+            backend:
+              service:
+                name: jaeger
+                port:
+                  number: 16686

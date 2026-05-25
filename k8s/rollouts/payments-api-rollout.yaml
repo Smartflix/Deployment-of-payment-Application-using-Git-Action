@@ -1,0 +1,216 @@
+# ─────────────────────────────────────────────────────────────────────────────
+# ARGO ROLLOUTS — CANARY DEPLOYMENT for payments-api (PRODUCTION)
+# ─────────────────────────────────────────────────────────────────────────────
+#
+# What is a Canary Deployment?
+# Instead of updating ALL pods at once (risky), canary deploys the new version
+# to a SMALL percentage of traffic first. If metrics are healthy, it
+# gradually increases. If something breaks, it auto-rolls back.
+#
+# Traffic flow for payments-api canary:
+#
+#   Step 1: 10% → new version  (90% still get old version)
+#           ↓  Wait 5 minutes, check error rate
+#   Step 2: 30% → new version  (if Step 1 metrics passed)
+#           ↓  Wait 5 minutes, check error rate
+#   Step 3: Manual approval required (human reviews)
+#   Step 4: 100% → new version  (old version terminated)
+#
+# Auto-rollback triggers if: error rate > 5% at ANY step.
+#
+# Install Argo Rollouts:
+#   kubectl create namespace argo-rollouts
+#   kubectl apply -n argo-rollouts -f https://github.com/argoproj/argo-rollouts/releases/latest/download/install.yaml
+
+---
+# ── Analysis Template: Check error rate via Prometheus ───────────────────────
+apiVersion: argoproj.io/v1alpha1
+kind: AnalysisTemplate
+metadata:
+  name: payments-api-success-rate
+  namespace: production
+spec:
+  args:
+    - name: service-name
+  metrics:
+    - name: success-rate
+      # Run this check every 60 seconds, 5 times. Fail if ANY result is below threshold.
+      interval: 60s
+      count: 5
+      failureLimit: 1
+      provider:
+        prometheus:
+          address: http://prometheus-server.monitoring.svc.cluster.local:9090
+          query: |
+            sum(rate(flask_http_request_total{
+              namespace="production",
+              app="payments-api",
+              status!~"5.."
+            }[2m])) /
+            sum(rate(flask_http_request_total{
+              namespace="production",
+              app="payments-api"
+            }[2m]))
+      # Fail the analysis if success rate drops below 95%
+      successCondition: result[0] >= 0.95
+      failureCondition: result[0] < 0.95
+
+    - name: error-rate
+      interval: 60s
+      count: 5
+      failureLimit: 1
+      provider:
+        prometheus:
+          address: http://prometheus-server.monitoring.svc.cluster.local:9090
+          query: |
+            sum(rate(flask_http_request_total{
+              namespace="production",
+              app="payments-api",
+              status=~"5.."
+            }[2m])) /
+            sum(rate(flask_http_request_total{
+              namespace="production",
+              app="payments-api"
+            }[2m]))
+      successCondition: result[0] <= 0.05  # Less than 5% error rate = good
+      failureCondition: result[0] > 0.05
+
+---
+# ── The Rollout (replaces regular Deployment in production) ───────────────────
+apiVersion: argoproj.io/v1alpha1
+kind: Rollout
+metadata:
+  name: payments-api
+  namespace: production
+  labels:
+    app: payments-api
+spec:
+  replicas: 5
+  selector:
+    matchLabels:
+      app: payments-api
+
+  # ── Canary Strategy ─────────────────────────────────────────────────────────
+  strategy:
+    canary:
+      # The canaryService gets traffic for the canary pods (new version)
+      # The stableService keeps the old version running
+      canaryService: payments-api-canary
+      stableService: payments-api-stable
+
+      # Traffic shaping via NGINX Ingress
+      trafficRouting:
+        nginx:
+          stableIngress: payday-ingress
+
+      steps:
+        # Step 1: Send 10% of traffic to new version, run analysis
+        - setWeight: 10
+        - analysis:
+            templates:
+              - templateName: payments-api-success-rate
+            args:
+              - name: service-name
+                value: payments-api
+
+        # Step 2: Increase to 30%, wait 5 more minutes
+        - setWeight: 30
+        - pause:
+            duration: 5m
+
+        # Step 3: Increase to 50%, wait for MANUAL approval
+        # A human must run: kubectl argo rollouts promote payments-api -n production
+        - setWeight: 50
+        - pause: {}
+
+        # Step 4: Full rollout (auto after manual approval)
+        - setWeight: 100
+
+      # Auto-rollback: revert if analysis fails at ANY step
+      autoPromotionEnabled: false  # Requires manual promotion at the pause step
+
+  # ── Pod Template ─────────────────────────────────────────────────────────────
+  template:
+    metadata:
+      labels:
+        app: payments-api
+      annotations:
+        prometheus.io/scrape: "true"
+        prometheus.io/port:   "8082"
+        prometheus.io/path:   "/metrics"
+    spec:
+      securityContext:
+        runAsNonRoot: true
+        runAsUser: 1000
+      containers:
+        - name: payments-api
+          image: ghcr.io/GITHUB_OWNER/payday-payments-api:IMAGE_TAG
+          ports:
+            - containerPort: 8082
+          env:
+            - name: PORT
+              value: "8082"
+            - name: APP_VERSION
+              value: "IMAGE_TAG"
+            - name: DATABASE_URL
+              valueFrom:
+                secretKeyRef:
+                  name: postgres-secret
+                  key: DATABASE_URL
+          resources:
+            requests:
+              cpu: 150m
+              memory: 128Mi
+            limits:
+              cpu: 500m
+              memory: 512Mi
+          readinessProbe:
+            httpGet:
+              path: /health
+              port: 8082
+            initialDelaySeconds: 10
+            periodSeconds: 10
+            failureThreshold: 3
+          livenessProbe:
+            httpGet:
+              path: /health
+              port: 8082
+            initialDelaySeconds: 20
+            periodSeconds: 20
+
+---
+# ── Stable Service (gets traffic for old/stable version) ─────────────────────
+apiVersion: v1
+kind: Service
+metadata:
+  name: payments-api-stable
+  namespace: production
+  labels:
+    app: payments-api
+spec:
+  selector:
+    app: payments-api
+  ports:
+    - name: http
+      port: 8082
+      targetPort: 8082
+  type: ClusterIP
+
+---
+# ── Canary Service (gets traffic for new/canary version) ─────────────────────
+apiVersion: v1
+kind: Service
+metadata:
+  name: payments-api-canary
+  namespace: production
+  labels:
+    app: payments-api
+    track: canary
+spec:
+  selector:
+    app: payments-api
+  ports:
+    - name: http
+      port: 8082
+      targetPort: 8082
+  type: ClusterIP

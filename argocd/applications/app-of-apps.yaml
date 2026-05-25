@@ -1,0 +1,51 @@
+# ─────────────────────────────────────────────────────────────────────────────
+# ARGO CD — App of Apps Pattern
+# ─────────────────────────────────────────────────────────────────────────────
+# This is the "root" Argo CD application.
+# Argo CD watches THIS file in git → which registers all other apps below.
+# Any change to your k8s/ manifests in git → Argo CD auto-applies to the cluster.
+#
+# INSTALL ARGO CD:
+#   kubectl create namespace argocd
+#   kubectl apply -n argocd -f https://raw.githubusercontent.com/argoproj/argo-cd/stable/manifests/install.yaml
+#
+# GET ARGO CD ADMIN PASSWORD:
+#   kubectl -n argocd get secret argocd-initial-admin-secret -o jsonpath="{.data.password}" | base64 -d
+#
+# ACCESS UI:
+#   kubectl port-forward svc/argocd-server -n argocd 8443:443
+#   Then open: https://localhost:8443
+#
+# REGISTER THIS APP (run once):
+#   argocd app create payday-apps \
+#     --repo https://github.com/YOUR_ORG/payday_platform \
+#     --path argocd/applications \
+#     --dest-server https://kubernetes.default.svc \
+#     --dest-namespace argocd \
+#     --sync-policy automated
+
+---
+apiVersion: argoproj.io/v1alpha1
+kind: Application
+metadata:
+  name: payday-apps
+  namespace: argocd
+  labels:
+    project: payday-platform
+spec:
+  project: default
+  source:
+    repoURL: https://github.com/YOUR_ORG/payday_platform   # Update with your repo URL
+    targetRevision: main
+    path: argocd/applications
+
+  destination:
+    server: https://kubernetes.default.svc
+    namespace: argocd
+
+  syncPolicy:
+    automated:
+      prune: true      # Delete resources removed from git
+      selfHeal: true   # Fix manual changes made directly to the cluster
+    syncOptions:
+      - CreateNamespace=true

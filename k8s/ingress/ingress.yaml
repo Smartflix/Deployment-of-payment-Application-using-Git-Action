@@ -1,0 +1,41 @@
+# NGINX Ingress Controller routes all external traffic to the frontend.
+# The frontend's nginx.conf already proxies /api/payments/* and /api/auth/*
+# to the correct backend services with the correct path rewrites — exactly
+# the same way docker-compose works locally.
+#
+# Traffic flow:
+#   https://<LB> → Ingress (TLS termination) → frontend (port 80)
+#                          ↳ /api/payments/* → payments-api:8082
+#                          ↳ /api/auth/*     → auth-api:8081
+#                          ↳ /*              → static HTML
+#
+# TLS: self-signed cert issued by cert-manager (see cert-manager-issuer.yaml).
+# Browser will show a "proceed anyway" warning — connection is still encrypted.
+# Replace with a real cert-manager ACME issuer when you have a custom domain.
+
+---
+apiVersion: networking.k8s.io/v1
+kind: Ingress
+metadata:
+  name: payday-ingress
+  namespace: staging
+  annotations:
+    nginx.ingress.kubernetes.io/proxy-body-size:      "10m"
+    nginx.ingress.kubernetes.io/proxy-read-timeout:   "30"
+    nginx.ingress.kubernetes.io/ssl-redirect:         "true"
+    nginx.ingress.kubernetes.io/force-ssl-redirect:   "true"
+spec:
+  ingressClassName: nginx
+  tls:
+    - secretName: payday-staging-tls
+  rules:
+    - http:
+        paths:
+          - path: /
+            pathType: Prefix
+            backend:
+              service:
+                name: frontend
+                port:
+                  number: 80
+
