@@ -35,7 +35,7 @@ metadata:
 spec:
   project: default
   source:
-    repoURL: https://github.com/YOUR_ORG/payday_platform   # Update with your repo URL
+    repoURL: https://github.com/Smartflix/Deployment-of-payment-Application-using-Git-Action.git  # Update with your repo URL
     targetRevision: main
     path: argocd/applications
 
