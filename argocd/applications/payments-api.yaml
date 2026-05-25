@@ -6,7 +6,7 @@ metadata:
 spec:
   project: default
   source:
-    repoURL: https://github.com/YOUR_ORG/payday_platform
+    repoURL: https://github.com/Smartflix/Deployment-of-payment-Application-using-Git-Action.git
     targetRevision: main
     path: k8s/rollouts    # Points to the Argo Rollouts canary config
   destination:
